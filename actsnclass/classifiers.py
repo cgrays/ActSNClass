@@ -23,7 +23,8 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 def random_forest(train_features:  np.array, train_labels: np.array,
-                  test_features: np.array, nest=1000, seed=42):
+                  test_features: np.array, nest=1000, seed=42, n_jobs = 1,
+                  feature_importances = False):
     """Random Forest classifier.
 
     Parameters
@@ -49,12 +50,15 @@ def random_forest(train_features:  np.array, train_labels: np.array,
     """
 
     # create classifier instance
-    clf = RandomForestClassifier(n_estimators=nest, random_state=seed)
+    clf = RandomForestClassifier(n_estimators=nest, random_state=seed, n_jobs=n_jobs)
     clf.fit(train_features, train_labels)                     # train
     predictions = clf.predict(test_features)                # predict
     prob = clf.predict_proba(test_features)       # get probabilities
-
-    return predictions, prob
+    
+    if feature_importances:
+        return predictions, prob, clf.feature_importances_
+    else:
+        return predictions, prob
 
 
 def main():

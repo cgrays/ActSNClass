@@ -51,7 +51,7 @@ def bazin(time, a, b, t0, tfall, trise):
     return a * X + b
 
 
-def errfunc(params, time, flux):
+def errfunc(params, time, flux, weights):
     """
     Absolute difference between theoretical and measured flux.
 
@@ -63,6 +63,8 @@ def errfunc(params, time, flux):
         exploratory variable (time of observation)
     flux : array_like
         response variable (measured flux)
+    weights: array_like
+        weights relating to the error in the data
 
     Returns
     -------
@@ -71,10 +73,10 @@ def errfunc(params, time, flux):
 
     """
 
-    return abs(flux - bazin(time, *params))
+    return abs(flux - bazin(time, *params)) * weights
 
 
-def fit_scipy(time, flux):
+def fit_scipy(time, flux, errors):
     """
     Find best-fit parameters using scipy.least_squares.
 
@@ -84,20 +86,35 @@ def fit_scipy(time, flux):
         exploratory variable (time of observation)
     flux : array_like
         response variable (measured flux)
+    errors: array_like
+        error in flux
 
     Returns
     -------
-    output : list of float
-        best fit parameter values
+    output : list of float, float
+        best fit parameter values, followed by the value of the cost function for the fit
 
     """
     flux = np.asarray(flux)
-    t0 = time[flux.argmax()] - time[0]
-    guess = [0, 0, t0, 40, -5]
+    errors = np.asarray(errors)
+    
+    sn = np.power(flux / errors, 2.)
+    start_point = (sn * flux).argmax()
+    
+    amp_init = flux[start_point]
+    t0_init = time[start_point]
+    
+    weights = 1. / (1. + errors)
+    
+    #t0 = time[flux.argmax()] - time[0]
+    #guess = [0, 0, t0, 40, -5]
+    
+    guess = [amp_init, 0, t0_init, 40, -5]
 
-    result = least_squares(errfunc, guess, args=(time, flux), method='lm')
+    
+    result = least_squares(errfunc, guess, args=(time, flux, weights), method='lm')
 
-    return result.x
+    return result.x, result.cost
 
 
 def main():

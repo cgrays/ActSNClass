@@ -22,7 +22,66 @@ import numpy as np
 
 
 def uncertainty_sampling(class_prob: np.array, test_ids: np.array,
-                         queryable_ids: np.array, batch=1,
+                         queryable_ids: np.array, batch=1, nclass=8,
+                         dump=False) -> list:
+    """Search for the sample with highest uncertainty in predicted class.
+
+    Parameters
+    ----------
+    class_prob: np.array
+        Classification probability. One value per class per object.
+    test_ids: np.array
+        Set of ids for objects in the test sample.
+    queryable_ids: np.array
+        Set of ids for objects available for querying.
+    batch: int (optional)
+        Number of objects to be chosen in each batch query.
+        Default is 1.
+    dump: bool (optional)
+        If True display on screen the shift in index and
+        the difference in estimated probabilities of being Ia
+        caused by constraints on the sample available for querying.
+
+    Returns
+    -------
+    query_indx: list
+            List of indexes identifying the objects from the test sample
+            to be queried in decreasing order of importance.
+    """
+    if nclass == 2:
+        # calculate distance to the decision boundary - only binary classification
+        dist = abs(class_prob[:, 1] - 0.5)
+    else:
+        # calculate the distance between the two most probable classes
+        probs = -(np.partition(-class_prob, 2, axis=1)[:,:2])
+        dist = np.abs(probs[:,0] - probs[:,1])
+
+    # get indexes in increasing order
+    order = dist.argsort()
+
+    # only allow objects in the query sample to be chosen
+    flag = []
+    for item in order:
+        if test_ids[item] in queryable_ids:
+            flag.append(True)
+        else:
+            flag.append(False)
+
+    # arrange queryable elements in increasing order
+    flag = np.array(flag)
+    final_order = order[flag]
+
+    if dump:
+        print('*** Displacement caused by constraints on query****')
+        print(' 0 -> ', list(order).index(final_order[0]))
+        print(class_prob[order[0]], '-- > ', class_prob[final_order[0]])
+
+    # return the index of the highest uncertain objects which are queryable
+    return list(final_order)[:batch]
+
+def boundary_sampling(class_prob: np.array, test_ids: np.array,
+                         queryable_ids: np.array, label_map: dict, boundary_class: int,
+                         batch=1, nclass=8,
                          dump=False) -> list:
     """Search for the sample with highest uncertainty in predicted class.
 
@@ -49,8 +108,16 @@ def uncertainty_sampling(class_prob: np.array, test_ids: np.array,
             to be queried in decreasing order of importance.
     """
 
-    # calculate distance to the decision boundary - only binary classification
-    dist = abs(class_prob[:, 1] - 0.5)
+    assert nclass > 2, "Boundary sampling is only defined for non-binary classification."
+    
+    classes = np.array(sorted(list(label_map.values())))
+    boundary_locs = np.where(classes==boundary_class)[0]
+    boundary_probs = class_prob[:,boundary_locs][:,0]
+    
+    remainingProbs = np.delete(class_prob,np.s_[boundary_locs],axis=1)
+    maxRemainingProbs = -(np.partition(-remainingProbs,1,axis=1)[:,0]) 
+
+    dist = np.abs(boundary_probs - maxRemainingProbs)
 
     # get indexes in increasing order
     order = dist.argsort()
@@ -75,9 +142,65 @@ def uncertainty_sampling(class_prob: np.array, test_ids: np.array,
     # return the index of the highest uncertain objects which are queryable
     return list(final_order)[:batch]
 
+def min_spread(class_prob: np.array, test_ids: np.array,
+                         queryable_ids: np.array, batch=1, nclass=8,
+                         dump=False) -> list:
+    """Search for the sample with highest uncertainty in predicted class.
+
+    Parameters
+    ----------
+    class_prob: np.array
+        Classification probability. One value per class per object.
+    test_ids: np.array
+        Set of ids for objects in the test sample.
+    queryable_ids: np.array
+        Set of ids for objects available for querying.
+    batch: int (optional)
+        Number of objects to be chosen in each batch query.
+        Default is 1.
+    dump: bool (optional)
+        If True display on screen the shift in index and
+        the difference in estimated probabilities of being Ia
+        caused by constraints on the sample available for querying.
+
+    Returns
+    -------
+    query_indx: list
+            List of indexes identifying the objects from the test sample
+            to be queried in decreasing order of importance.
+    """
+    
+    assert nclass > 2, "Sampling with 'min_spread' is only defined for non-binary classification."
+    
+    spread = np.std(class_prob,axis=1)
+
+    dist = spread 
+
+    # get indexes in increasing order
+    order = dist.argsort()
+
+    # only allow objects in the query sample to be chosen
+    flag = []
+    for item in order:
+        if test_ids[item] in queryable_ids:
+            flag.append(True)
+        else:
+            flag.append(False)
+
+    # arrange queryable elements in increasing order
+    flag = np.array(flag)
+    final_order = order[flag]
+
+    if dump:
+        print('*** Displacement caused by constraints on query****')
+        print(' 0 -> ', list(order).index(final_order[0]))
+        print(class_prob[order[0]], '-- > ', class_prob[final_order[0]])
+
+    # return the index of the highest uncertain objects which are queryable
+    return list(final_order)[:batch]
 
 def random_sampling(test_ids: np.array, queryable_ids: np.array,
-                    batch=1, seed=42) -> list:
+                    batch=1, nclass=8,seed=42) -> list:
     """Randomly choose an object from the test sample.
 
     Parameters

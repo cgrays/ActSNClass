@@ -21,8 +21,8 @@ import os
 import pandas as pd
 
 from actsnclass.classifiers import random_forest
-from actsnclass.query_strategies import uncertainty_sampling, random_sampling
-from actsnclass.metrics import get_snpcc_metric
+from actsnclass.query_strategies import uncertainty_sampling, random_sampling, boundary_sampling, min_spread
+from actsnclass.metrics import get_snpcc_metric, get_confusion_matrix
 
 
 __all__ = ['DataBase']
@@ -152,8 +152,12 @@ class DataBase:
         self.train_features = np.array([])
         self.train_metadata = pd.DataFrame()
         self.train_labels = np.array([])
+        self.label_map = dict()
+        self.cm = np.array([])
+        self.feature_importances = np.array([])
+        self.all_cms = list()
 
-    def load_bazin_features(self, path_to_bazin_file: str, screen=False):
+    def load_bazin_features(self, paths_to_bazin_files: list, screen=False):
         """Load Bazin features from file.
 
         Populate properties: data, features, feature_list, header
@@ -169,7 +173,11 @@ class DataBase:
         """
 
         # read matrix with Bazin features
-        self.data = pd.read_csv(path_to_bazin_file, sep=' ', index_col=False)
+        self.data = pd.concat([pd.read_csv(j, sep=' ', index_col=False) for j in paths_to_bazin_files], ignore_index=True)
+ 
+        # remove bad rows
+        self.data = self.data.drop(columns='Unnamed: 40')
+        self.data = self.data.replace(to_replace='None', value=np.nan).dropna()
 
         # list of features to use
         self.features_names = ['gA', 'gB', 'gt0', 'gtfall', 'gtrise', 'rA',
@@ -177,16 +185,75 @@ class DataBase:
                                'it0', 'itfall', 'itrise', 'zA', 'zB', 'zt0',
                                'ztfall', 'ztrise']
 
-        self.metadata_names = ['id', 'redshift', 'type', 'code', 'sample']
+        self.metadata_names = ['id', 'redshift', 'type', 'sample']
 
         self.features = self.data[self.features_names]
         self.metadata = self.data[self.metadata_names]
 
         if screen:
             print('Loaded ', self.metadata.shape[0], ' samples!')
+            
+    def load_gp_features(self, paths_to_gp_files: list, screen=False):
+        """Load Gaussian Process features from file.
 
-    def load_features(self, path_to_file: str, method='Bazin',
-                      screen=False):
+        Populate properties: data, features, feature_list, header
+        and header_list.
+
+        Parameters
+        ----------
+        path_to_gp_file: str
+            Complete path to GP features file.
+        screen: bool (optional)
+            If True, print on screen number of light curves processed.
+            Default is False.
+        """
+
+        # read matrix with Bazin features
+        self.data = pd.concat([pd.read_csv(j, sep=' ', index_col=False) for j in paths_to_gp_files], ignore_index=True)
+        
+        # remove bad rows
+        self.data = self.data.drop(columns='Unnamed: 41')
+        self.data = self.data.replace(to_replace='None', value=np.nan).dropna()
+
+        # list of features to use
+        if 'rbf1_l' in self.data.columns:
+            self.features_names = ['host_photoz', 'host_photoz_err',\
+                                    'pkmag_i', 'pos_flux_ratio', 'max_fr_blue', 'min_fr_blue',\
+                                    'max_fr_red', 'min_fr_red', 'max_dt_yg', 'positive_width', 'time_fwd_max_20', 'time_fwd_max_50',\
+                                    'time_bwd_max_20', 'time_bwd_max_50', 'time_fwd_max_20_ratio_blue',
+                                    'time_fwd_max_50_ratio_blue', 'time_bwd_max_20_ratio_blue', 'time_bwd_max_50_ratio_blue',\
+                                    'time_fwd_max_20_ratio_red', 'time_fwd_max_50_ratio_red', 'time_bwd_max_20_ratio_red',\
+                                    'time_bwd_max_50_ratio_red', 'frac_s2n_5', 'frac_background', 'time_width_s2n_5',\
+                                    'count_max_center', 'count_max_rise_20', 'count_max_rise_50', 'count_max_rise_100',\
+                                    'count_max_fall_20', 'count_max_fall_50', 'count_max_fall_100', 'total_s2n',\
+                                    'c1', 'rbf1_t', 'rbf1_l', 'c2', 'rbf2_t', 'rbf2_l', 'c3', 'rbf3_t',\
+                                    'rbf3_l', 'loglike']
+        
+        elif 'matern_t' in self.data.columns:
+            self.features_names = ['host_photoz', 'host_photoz_err',\
+                                    'pkmag_i', 'pos_flux_ratio', 'max_fr_blue', 'min_fr_blue',\
+                                    'max_fr_red', 'min_fr_red', 'max_dt_yg', 'positive_width', 'time_fwd_max_20', 'time_fwd_max_50',\
+                                    'time_bwd_max_20', 'time_bwd_max_50', 'time_fwd_max_20_ratio_blue',
+                                    'time_fwd_max_50_ratio_blue', 'time_bwd_max_20_ratio_blue', 'time_bwd_max_50_ratio_blue',\
+                                    'time_fwd_max_20_ratio_red', 'time_fwd_max_50_ratio_red', 'time_bwd_max_20_ratio_red',\
+                                    'time_bwd_max_50_ratio_red', 'frac_s2n_5', 'frac_background', 'time_width_s2n_5',\
+                                    'count_max_center', 'count_max_rise_20', 'count_max_rise_50', 'count_max_rise_100',\
+                                    'count_max_fall_20', 'count_max_fall_50', 'count_max_fall_100', 'total_s2n',\
+                                    'c1', 'matern_t', 'matern_l', 'loglike']
+            
+        else:
+            raise ValueError('Unexpected columns in data.')
+            
+        self.metadata_names = ['id', 'redshift', 'type', 'sample']
+
+        self.features = self.data[self.features_names]
+        self.metadata = self.data[self.metadata_names]
+
+        if screen:
+            print('Loaded ', self.metadata.shape[0], ' samples!')            
+
+    def load_features(self, paths_to_files: list, method='Bazin',
+                      screen=True):
         """Load features according to the chosen feature extraction method.
 
         Populates properties: data, features, feature_list, header
@@ -205,13 +272,15 @@ class DataBase:
         """
 
         if method == 'Bazin':
-            self.load_bazin_features(path_to_file, screen=screen)
+            self.load_bazin_features(paths_to_files, screen=screen)
+        elif method == 'GP':
+            self.load_gp_features(paths_to_files, screen=screen)
         else:
-            raise ValueError('Only Bazin features are implemented! '
+            raise ValueError('Only Bazin and GP features are implemented! '
                              '\n Feel free to add other options.')
 
     def build_samples(self, initial_training='original', nclass=2,
-                      screen=False):
+                      screen=True):
         """Separate train and test samples.
 
         Populate properties: train_features, train_header, test_features,
@@ -233,7 +302,7 @@ class DataBase:
         """
 
         # separate original training and test samples
-        if initial_training == 'original':
+        if initial_training == 'original' and nclass == 2:
             train_flag = self.metadata['sample'] == 'train'
             train_data = self.features[train_flag]
             self.train_features = train_data.values
@@ -256,12 +325,10 @@ class DataBase:
                 self.train_labels = np.array([int(item) for item in train_ia_flag])
 
                 test_ia_flag = self.test_metadata['type'] == 'Ia'
-                self.test_labels = np.array([int(item) for item in test_ia_flag])
-            else:
-                raise ValueError("Only 'Ia x non-Ia' are implemented! "
-                                 "\n Feel free to add other options.")
-
-        elif isinstance(initial_training, int):
+                self.test_labels = np.array([int(item) for item in test_ia_flag])         
+        
+        # separate training and test samples from scratch
+        elif isinstance(initial_training, int) and nclass == 2:
 
             # initialize the temporary label holder
             train_indexes = np.array([1])
@@ -298,8 +365,80 @@ class DataBase:
                 combined_flag = np.logical_and(test_flag, queryable_flag)
                 self.queryable_ids = self.metadata[combined_flag]['id'].values
             else:
-                self.queryable_ids = self.test_metadata['id'].values
+                self.queryable_ids = self.test_metadata['id'].values                
 
+        elif initial_training == 'original' and nclass > 2:
+
+            train_indexes = self.metadata['sample'] == 'train'
+
+            for k, sntype in enumerate(np.unique(self.metadata['type'])):
+                self.label_map[sntype] = k
+                
+            assert len(np.unique(self.metadata['type'])) == nclass,\
+            'Mismatch between number of classes specified and number of unique types in your data.'
+            
+            # set training
+            train_flag = [self.label_map[k] for k in self.metadata['type'].values[train_indexes]]
+            self.train_labels = np.array([int(item) for item in train_flag])
+            self.train_features = self.features.values[train_indexes]
+            self.train_metadata = pd.DataFrame(self.metadata.values[train_indexes],
+                                               columns=self.metadata_names)
+
+            # set test set as all objs apart from those in training
+            test_indexes = np.logical_or(self.metadata['sample'] == 'test',
+                                      self.metadata['sample'] == 'queryable')
+            test_ia_flag = [self.label_map[k] for k in self.metadata['type'].values[test_indexes]]
+            self.test_labels = np.array([int(item) for item in test_ia_flag])
+            self.test_features = self.features.values[test_indexes]
+            self.test_metadata = pd.DataFrame(self.metadata.values[test_indexes],
+                                              columns=self.metadata_names)
+
+            if 'queryable' in self.metadata['sample'].values:
+                test_flag = np.array([True if i in test_indexes else False
+                                      for i in range(self.metadata.shape[0])])
+                queryable_flag = self.metadata['sample'] == 'queryable'
+                combined_flag = np.logical_and(test_flag, queryable_flag)
+                self.queryable_ids = self.metadata[combined_flag]['id'].values
+            else:
+                self.queryable_ids = self.test_metadata['id'].values
+                
+        elif isinstance(initial_training, int) and nclass > 2:
+
+            train_indexes = np.random.randint(low=0,
+                                              high=self.metadata.shape[0],
+                                              size=initial_training)
+
+            for k, sntype in enumerate(np.unique(self.metadata['type'])):
+                self.label_map[sntype] = k
+                
+            assert len(np.unique(self.metadata['type'])) == nclass,\
+            'Mismatch between number of classes specified and number of unique types in your data.'
+            
+            # set training
+            train_flag = [self.label_map[k] for k in self.metadata['type'].values[train_indexes]]
+            self.train_labels = np.array([int(item) for item in train_flag])
+            self.train_features = self.features.values[train_indexes]
+            self.train_metadata = pd.DataFrame(self.metadata.values[train_indexes],
+                                               columns=self.metadata_names)
+
+            # set test set as all objs apart from those in training
+            test_indexes = np.array([i for i in range(self.metadata.shape[0])
+                                     if i not in train_indexes])
+            test_ia_flag = [self.label_map[k] for k in self.metadata['type'].values[test_indexes]]
+            self.test_labels = np.array([int(item) for item in test_ia_flag])
+            self.test_features = self.features.values[test_indexes]
+            self.test_metadata = pd.DataFrame(self.metadata.values[test_indexes],
+                                              columns=self.metadata_names)
+
+            if 'queryable' in self.metadata['sample'].values:
+                test_flag = np.array([True if i in test_indexes else False
+                                      for i in range(self.metadata.shape[0])])
+                queryable_flag = self.metadata['sample'] == 'queryable'
+                combined_flag = np.logical_and(test_flag, queryable_flag)
+                self.queryable_ids = self.metadata[combined_flag]['id'].values
+            else:
+                self.queryable_ids = self.test_metadata['id'].values
+                
         else:
             raise ValueError('"Initial training" should be '
                              '"original" or integer.')
@@ -308,7 +447,7 @@ class DataBase:
             print('Training set size: ', self.train_metadata.shape[0])
             print('Test set size: ', self.test_metadata.shape[0])
 
-    def classify(self, method='RandomForest'):
+    def classify(self, method='RandomForest', n_jobs = 1, feature_importances = False):
         """Apply a machine learning classifier.
 
         Populate properties: predicted_class and class_prob
@@ -317,13 +456,19 @@ class DataBase:
         ----------
         method: str (optional)
             Chosen classifier.
-            The current implementation on accepts `RandomForest`.
+            The current implementation only accepts `RandomForest'.
         """
-
+        
         if method == 'RandomForest':
-            self.predicted_class,  self.classprob = \
-                random_forest(self.train_features, self.train_labels,
-                              self.test_features)
+            if feature_importances:
+                self.predicted_class,  self.classprob, self.feature_importances = \
+                    random_forest(self.train_features, self.train_labels,
+                                  self.test_features, n_jobs = n_jobs,
+                                  feature_importances = feature_importances)
+            else:
+                self.predicted_class,  self.classprob = \
+                    random_forest(self.train_features, self.train_labels,
+                                  self.test_features, n_jobs = n_jobs)          
 
         else:
             raise ValueError('Only RandomForest classifier is implemented!'
@@ -344,11 +489,16 @@ class DataBase:
             self.metrics_list_names, self.metrics_list_values = \
                 get_snpcc_metric(list(self.predicted_class),
                                  list(self.test_labels))
+        elif metric_label == 'cm':
+            self.cm = get_confusion_matrix(y_true = self.test_labels,\
+                                          y_pred = self.predicted_class)
+            self.all_cms.extend(get_confusion_matrix(y_true = self.test_labels,\
+                                          y_pred = self.predicted_class))
         else:
-            raise ValueError('Only snpcc metric is implemented!'
+            raise ValueError('Only snpcc and cm metrics are implemented!'
                              '\n Feel free to add other options.')
 
-    def make_query(self, strategy='UncSampling', batch=1,
+    def make_query(self, strategy='UncSampling', batch=1, nclass=8,
                    dump=False) -> list:
         """Identify new object to be added to the training sample.
 
@@ -379,13 +529,34 @@ class DataBase:
             query_indx = uncertainty_sampling(class_prob=self.classprob,
                                               queryable_ids=self.queryable_ids,
                                               test_ids=self.test_metadata['id'].values,
-                                              batch=batch, dump=dump)
+                                              batch=batch, dump=dump, nclass=nclass)
             return query_indx
+        
+        elif strategy == 'boundary_Ia':
+            
+            boundary_idx = self.label_map['Ia']
+            
+            query_indx = boundary_sampling(class_prob=self.classprob,
+                                              queryable_ids=self.queryable_ids,
+                                              test_ids=self.test_metadata['id'].values,
+                                              label_map=self.label_map, boundary_class=boundary_idx,
+                                              batch=batch, dump=dump, nclass=nclass)
+            return query_indx
+        
+        elif strategy == 'min_spread':
+            
+            query_indx = min_spread(class_prob=self.classprob,
+                                              queryable_ids=self.queryable_ids,
+                                              test_ids=self.test_metadata['id'].values,
+                                              batch=batch, dump=dump, nclass=nclass)
+            
+            return query_indx
+        
 
         elif strategy == 'RandomSampling':
             query_indx = random_sampling(queryable_ids=self.queryable_ids,
                                          test_ids=self.test_metadata['id'].values,
-                                         batch=batch)
+                                         batch=batch,nclass=nclass)
 
             for n in query_indx:
                 if self.test_metadata['id'].values[n] not in self.queryable_ids:
@@ -444,7 +615,7 @@ class DataBase:
         # update queried samples
         self.queried_sample.append(all_queries)
 
-    def save_metrics(self, loop: int, output_metrics_file: str, epoch: int, batch=1):
+    def save_metrics(self, loop: int, output_metrics_file: str, epoch: int, batch=1, metric_label='snpcc'):
         """Save current metrics to file.
 
         If loop == 0 the 'output_metrics_file' will be created or overwritten.
@@ -462,24 +633,31 @@ class DataBase:
             Days since the beginning of the survey.
         """
 
-        # add header to metrics file
-        if not os.path.exists(output_metrics_file) or loop == 0:
-            with open(output_metrics_file, 'w') as metrics:
-                metrics.write('loop ')
-                for name in self.metrics_list_names:
-                    metrics.write(name + ' ')
-                for j in range(batch):
-                    metrics.write('query_id' + str(j + 1))
-                metrics.write('\n')
+        if metric_label == 'snpcc':
+            # add header to metrics file
+            if not os.path.exists(output_metrics_file) or loop == 0:
+                with open(output_metrics_file, 'w') as metrics:
+                    metrics.write('loop ')
+                    for name in self.metrics_list_names:
+                        metrics.write(name + ' ')
+                    for j in range(batch):
+                        metrics.write('query_id' + str(j + 1))
+                    metrics.write('\n')
 
-        # write to file
-        with open(output_metrics_file, 'a') as metrics:
-            metrics.write(str(epoch) + ' ')
-            for value in self.metrics_list_values:
-                metrics.write(str(value) + ' ')
-            for j in range(batch):
-                metrics.write(str(self.queried_sample[loop][j][1]) + ' ')
-            metrics.write('\n')
+            # write to file
+            with open(output_metrics_file, 'a') as metrics:
+                metrics.write(str(epoch) + ' ')
+                for value in self.metrics_list_values:
+                    metrics.write(str(value) + ' ')
+                for j in range(batch):
+                    metrics.write(str(self.queried_sample[loop][j][1]) + ' ')
+                metrics.write('\n')
+                
+        elif metric_label == 'cm':
+            np.savetxt(output_metrics_file,self.all_cms)
+            
+        else:
+            raise ValueError('Invalid metric label.')
 
     def save_queried_sample(self, queried_sample_file: str, loop: int,
                             full_sample=False, batch=1):

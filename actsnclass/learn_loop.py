@@ -24,7 +24,9 @@ from actsnclass import DataBase
 def learn_loop(nloops: int, strategy: str, path_to_features: str,
                output_diag_file: str, output_queried_file: str,
                features_method='Bazin', classifier='RandomForest',
-               training='original', batch=1, screen=True):
+               training='original', batch=1, screen=True,
+               metric_label='snpcc', n_jobs=1, feature_importances=False,
+               nclass=2):
     """Perform the active learning loop. All results are saved to file.
 
     Parameters
@@ -33,7 +35,7 @@ def learn_loop(nloops: int, strategy: str, path_to_features: str,
         Number of active learning loops to run.
     strategy: str
         Query strategy. Options are 'UncSampling' and 'RandomSampling'.
-    path_to_features: str
+    path_to_features: list
         Complete path to input features file.
     output_diag_file: str
         Full path to output file to store diagnostics of each loop.
@@ -64,7 +66,7 @@ def learn_loop(nloops: int, strategy: str, path_to_features: str,
                        screen=screen)
 
     # separate training and test samples
-    data.build_samples(initial_training=training)
+    data.build_samples(initial_training=training, nclass=nclass, screen=True)
 
     for loop in range(nloops):
 
@@ -72,20 +74,20 @@ def learn_loop(nloops: int, strategy: str, path_to_features: str,
             print('Processing... ', loop)
 
         # classify
-        data.classify(method=classifier)
+        data.classify(method=classifier, n_jobs = n_jobs, feature_importances = feature_importances)
 
         # calculate metrics
-        data.evaluate_classification()
+        data.evaluate_classification(metric_label = metric_label)
 
         # choose object to query
-        indx = data.make_query(strategy=strategy, batch=batch)
+        indx = data.make_query(strategy=strategy, batch=batch, nclass=nclass)
 
         # update training and test samples
         data.update_samples(indx, loop=loop)
 
         # save diagnostics for current state
         data.save_metrics(loop=loop, output_metrics_file=output_diag_file,
-                          batch=batch, epoch=loop)
+                          batch=batch, epoch=loop, metric_label=metric_label)
 
         # save query sample to file
         data.save_queried_sample(output_queried_file, loop=loop,

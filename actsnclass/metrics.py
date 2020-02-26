@@ -16,6 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from sklearn.metrics import confusion_matrix
+
 __all__ = ['efficiency', 'purity', 'fom', 'accuracy', 'get_snpcc_metric']
 
 
@@ -165,7 +167,15 @@ def get_snpcc_metric(label_pred: list, label_true: list, ia_flag=1,
 
     return metric_names, metric_values
 
-
+def get_confusion_matrix(y_true, y_pred):
+    """
+    This function generates the confusion matrix.
+    """    
+    # Compute confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+        
+    return cm
+    
 def main():
     return None
 

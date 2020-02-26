@@ -17,13 +17,25 @@
 # limitations under the License.
 
 from actsnclass.bazin import bazin, fit_scipy
+#from actsnclass.GP import run_code
+from actsnclass.GP_sklearn import GP, kernel_RBF, kernel_Matern
+from sklearn.gaussian_process import GaussianProcessRegressor
 
 import matplotlib.pylab as plt
+from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import os
 import pandas as pd
 
-__all__ = ['LightCurve', 'fit_snpcc_bazin']
+from astropy.table import Table
+
+import multiprocessing
+from multiprocessing import Manager
+from functools import partial
+
+from tqdm import tqdm
+
+__all__ = ['LightCurve', 'fit_snpcc_bazin', 'run_parallel_job', 'fit_plasticc_bazin', 'fit_plasticc_GP']
 
 
 class LightCurve(object):
@@ -36,6 +48,8 @@ class LightCurve(object):
     bazin_features: list
         List with the 5 best-fit Bazin parameters in all filters.
         Concatenated from blue to red.
+    bazin_band_cost: list
+        List of 6 floats corresponding to the value of the cost function for the fit in each band.
     dataset_name: str
         Name of the survey or data set being analyzed.
     filters: list
@@ -108,9 +122,24 @@ class LightCurve(object):
 
     def __init__(self):
         self.bazin_features = []
-        self.bazin_features_names = ['a', 'b', 't0', 'tfall', 'trsise']
+        self.bazin_features_names = ['a', 'b', 't0', 'tfall', 'trise']
+        self.bazin_band_cost = []
+        self.GP_kernel_params = []
+        self.GP_kernel = []
+        self.GP_features = []
+        self.GP_feature_names = ['host_photoz', 'host_photoz_err',\
+                                 'pkmag_i', 'pos_flux_ratio', 'max_fr_blue', 'min_fr_blue',\
+                                'max_fr_red', 'min_fr_red', 'max_dt_yg', 'positive_width', 'time_fwd_max_20', 'time_fwd_max_50',\
+                                'time_bwd_max_20', 'time_bwd_max_50', 'time_fwd_max_20_ratio_blue',
+                                'time_fwd_max_50_ratio_blue', 'time_bwd_max_20_ratio_blue', 'time_bwd_max_50_ratio_blue',\
+                                'time_fwd_max_20_ratio_red', 'time_fwd_max_50_ratio_red', 'time_bwd_max_20_ratio_red',\
+                                'time_bwd_max_50_ratio_red', 'frac_s2n_5', 'frac_background', 'time_width_s2n_5',\
+                                'count_max_center', 'count_max_rise_20', 'count_max_rise_50', 'count_max_rise_100',\
+                                'count_max_fall_20', 'count_max_fall_50', 'count_max_fall_100',\
+                                'total_s2n']
         self.dataset_name = ' '
         self.filters = []
+        self.tfluxes = []
         self.id = 0
         self.photometry = pd.DataFrame()
         self.redshift = 0
@@ -118,6 +147,7 @@ class LightCurve(object):
         self.sim_peakmag = []
         self.sncode = 0
         self.sntype = ' '
+        self.num_classes = 0
 
     def load_snpcc_lc(self, path_to_data: str):
         """Reads one LC from SNPCC data.
@@ -202,6 +232,183 @@ class LightCurve(object):
         self.photometry['MAG'] = np.array([float(item) for item in photometry_raw[:, header.index('MAG')]])
         self.photometry['MAGERR'] = np.array([float(item) for item in photometry_raw[:, header.index('MAGERR')]])
 
+    def load_plasticc_lc_fromfile(self, path_to_data: str, path_to_metadata: str, lc_id: int, num_classes = 8):
+        """Reads one LC from the astropy table containing the PLAsTiCC data.
+
+        Populates the attributes: dataset_name, id, sample, redshift, sncode
+        sntype, and photometry.
+
+        Parameters
+        ---------
+        path_to_data: str
+            Path to text file with data from a single SN.
+            
+        path_to_metadata: str
+            Path to the corresponding metadata file that contains information on the target SN (either the train or test metadata).
+            
+        lc_id: int
+            The light curve ID to pull from the astropy Table.
+        """
+
+        # set the designation of the data set
+        self.dataset_name = 'PLAsTiCC'
+        self.num_classes = num_classes
+
+        # set filters
+        self.filters = ['u', 'g', 'r', 'i', 'z', 'y']
+        
+        passband_dict = {0: 'u', 1: 'g', 2: 'r', 3: 'i', 4: 'z', 5: 'y'}
+
+        wavelength_dict = {0: 365, 1: 464, 2: 658, 3: 806, 4: 900, 5: 1020}
+
+        # set SN types
+        if self.num_classes == 8:
+            SNtypes = {'90': 'Ia',
+                      '42': 'II',
+                      '62': 'Ibc',
+                      '67': 'Ia-91bg',
+                      '52': 'Ia-x',
+                      '95': 'SLSN-I',
+                      '15': 'TDE',
+                      '64': 'KN'}
+        elif self.num_classes == 3:
+            SNtypes = {'90': 'Ia',
+                      '42': 'II',
+                      '62': 'Ibc'}        
+        
+        # read metadata
+        with open(path_to_metadata,'rb') as f2:
+            meta_table = Table.read(f2,format='csv')
+            
+            assert lc_id in meta_table['object_id'], 'Desired light curve not in metadata file!'
+            
+            lc_meta = meta_table[meta_table['object_id']==lc_id]
+        
+        self.tfluxes = [lc_meta['tflux_{0}'.format(f)] for f in self.filters]
+        
+        true_target = str(int(lc_meta['true_target'].data[0]))
+        if true_target not in list(SNtypes.keys()):
+            raise ValueError('Unknown transient type!')
+        else:
+            pass
+        
+        # read light curve data
+        with open(path_to_data,'rb') as f1:
+            lc_table = Table.read(f1,format='csv')
+            lc_photometry = lc_table[lc_table['object_id']==lc_id]
+              
+        # get header information
+        self.id = int(lc_meta['object_id'])
+        
+        if 'train' in path_to_metadata:
+            self.sample = 'train'
+        else:
+            self.sample = 'test'
+            
+        self.redshift = float(lc_meta['true_z'])
+        
+        self.sntype = SNtypes[true_target]
+        self.sncode = true_target
+
+        # put photometry into data frame
+        self.photometry['mjd'] = np.array(lc_photometry['mjd'])
+        self.photometry['band'] = np.array([passband_dict[key] for key in np.array(lc_photometry['passband'])])
+        self.photometry['passband'] = np.array(lc_photometry['passband'])
+        self.photometry['lambda_cen'] = np.array([wavelength_dict[key] for key in np.array(lc_photometry['passband'])])
+        # add the template flux values to the flux
+        self.photometry['flux'] = np.array(lc_photometry['flux']) + np.take(self.tfluxes, self.photometry['passband'])
+        self.photometry['fluxerr'] = np.array(lc_photometry['flux_err'])
+        self.photometry['SNR'] = (self.photometry['flux'] / self.photometry['fluxerr']) ** 2.
+        #self.photometry['MAG'] = 22.0 - 2.5*np.log10(self.photometry['flux'])
+        #self.photometry['MAGERR'] = 22.0 - 2.5*np.log10(self.photometry['fluxerr'])
+        
+        self.GP_features = [lc_meta['hostgal_photoz'].data[0], lc_meta['hostgal_photoz_err'].data[0]]
+        
+    def load_plasticc_lc(self, meta_table: Table, lc_table: Table, lc_id: int, path_to_metadata: str, num_classes = 8):
+        """Reads one LC from the astropy table containing the PLAsTiCC data.
+
+        Populates the attributes: dataset_name, id, sample, redshift, sncode,
+        sntype, target, and photometry.
+
+        Parameters
+        ---------
+        path_to_data: str
+            Path to text file with data from a single SN.
+            
+        path_to_metadata: str
+            Path to the corresponding metadata file that contains information on the target SN (either the train or test metadata).
+            
+        lc_id: int
+            The light curve ID to pull from the astropy Table.
+        """
+
+        # set the designation of the data set
+        self.dataset_name = 'PLAsTiCC'
+        self.num_classes = num_classes
+
+        # set filters
+        self.filters = ['u', 'g', 'r', 'i', 'z', 'y']
+        
+        passband_dict = {0: 'u', 1: 'g', 2: 'r', 3: 'i', 4: 'z', 5: 'y'}
+        
+        wavelength_dict = {0: 365, 1: 464, 2: 658, 3: 806, 4: 900, 5: 1020}
+
+        # set SN types
+        if self.num_classes == 8:
+            SNtypes = {'90': 'Ia',
+                      '42': 'II',
+                      '62': 'Ibc',
+                      '67': 'Ia-91bg',
+                      '52': 'Ia-x',
+                      '95': 'SLSN-I',
+                      '15': 'TDE',
+                      '64': 'KN'}
+        elif self.num_classes == 3:
+            SNtypes = {'90': 'Ia',
+                      '42': 'II',
+                      '62': 'Ibc'} 
+        
+        # read metadata
+        lc_meta = meta_table[meta_table['object_id']==lc_id]
+        
+        self.tfluxes = [lc_meta['tflux_{0}'.format(f)] for f in self.filters]
+        
+        
+        true_target = str(int(lc_meta['true_target'].data[0]))
+        if true_target not in list(SNtypes.keys()):
+            raise ValueError('Unknown transient type!')
+        else:
+            pass
+        
+        # read light curve data
+        lc_photometry = lc_table[lc_table['object_id']==lc_id]
+        
+        # get header information
+        self.id = int(lc_meta['object_id'])
+        
+        if 'train' in path_to_metadata:
+            self.sample = 'train'
+        else:
+            self.sample = 'test'
+            
+        self.redshift = float(lc_meta['true_z'])
+        
+        self.sntype = SNtypes[true_target]
+        self.sncode = true_target
+ 
+        # put photometry into data frame
+        self.photometry['mjd'] = np.array(lc_photometry['mjd'])
+        self.photometry['band'] = np.array([passband_dict[key] for key in np.array(lc_photometry['passband'])])
+        self.photometry['passband'] = np.array(lc_photometry['passband'])
+        self.photometry['lambda_cen'] = np.array([wavelength_dict[key] for key in np.array(lc_photometry['passband'])])
+        self.photometry['flux'] = np.array(lc_photometry['flux']) + np.take(self.tfluxes, self.photometry['passband'])
+        self.photometry['fluxerr'] = np.array(lc_photometry['flux_err'])
+        self.photometry['SNR'] = (self.photometry['flux'] / self.photometry['fluxerr']) ** 2.
+        #self.photometry['MAG'] = 22.0 - 2.5*np.log10(self.photometry['flux'])
+        #self.photometry['MAGERR'] = 22.0 - 2.5*np.log10(self.photometry['fluxerr'])
+        
+        self.GP_features = [lc_meta['hostgal_photoz'].data[0], lc_meta['hostgal_photoz_err'].data[0]]
+
     def check_queryable(self, mjd: float, r_lim: float):
         """Check if this light can be queried in a given day.
 
@@ -245,8 +452,9 @@ class LightCurve(object):
 
         Returns
         -------
-        bazin_param: list
-            Best fit parameters for the Bazin function: [a, b, t0, tfall, trise]
+        bazin_param: list, float
+            Best fit parameters for the Bazin function: [a, b, t0, tfall, trise] followed by a float corresponding to 
+            the value of the cost function for the fit.
         """
 
         # build filter flag
@@ -254,12 +462,39 @@ class LightCurve(object):
 
         # get info for this filter
         time = self.photometry['mjd'].values[filter_flag]
-        flux = self.photometry['flux'].values[filter_flag]
+        ### Do we want to be subtracting off the minimum flux here?
+        flux = self.photometry['flux'].values[filter_flag] - np.min(self.photometry['flux'].values)
+        errors = self.photometry['fluxerr'].values[filter_flag]
 
         # fit Bazin function
-        bazin_param = fit_scipy(time - time[0], flux)
+        bazin_param = fit_scipy(time - time[0], flux, errors)
 
         return bazin_param
+
+    def fit_GP(self,restarts=0, kernel_type=1):
+        """Construct the GP fit simultaneously for all bands and extract features used for learning.
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        GP_result: type 
+        fill in info here.
+        
+        Populates the attributes: GP_kernel_params, GP_features
+        """        
+        fit_result = GP(self, restarts=restarts, kernel_type=kernel_type)
+
+        self.GP_kernel_params = fit_result[0]
+        self.GP_features.extend(fit_result[1])
+        self.GP_features.extend(fit_result[0])
+        
+        if kernel_type == 0 or kernel_type == 1:
+            self.GP_kernel = ['c1','rbf1_t', 'rbf1_l', 'c2', 'rbf2_t', 'rbf2_l', 'c3', 'rbf3_t', 'rbf3_l']
+            
+        elif kernel_type == 2:
+            self.GP_kernel = ['c1', 'matern_t', 'matern_l']
 
     def fit_bazin_all(self):
         """Perform Bazin fit for all filters independently and concatenate results.
@@ -271,20 +506,26 @@ class LightCurve(object):
             # build filter flag
             filter_flag = self.photometry['band'] == band
 
+            # ensure that at least 5 data points have been observed in the band
             if sum(filter_flag) > 4:
-                best_fit = self.fit_bazin(band)
+                fit_result = self.fit_bazin(band)
+                best_fit = fit_result[0]
+                fit_cost = fit_result[1]
 
                 if sum([str(item) == 'nan' for item in best_fit]) == 0:
                     for fit in best_fit:
                         self.bazin_features.append(fit)
+                    self.bazin_band_cost.append(fit_cost)
                 else:
                     for i in range(5):
                         self.bazin_features.append('None')
+                    self.bazin_band_cost.append('None')
             else:
                 for i in range(5):
                     self.bazin_features.append('None')
+                self.bazin_band_cost.append('None')
 
-    def plot_bazin_fit(self, save=True, show=False, output_file=' '):
+    def plot_bazin_fit(self, save=False, show=True, output_file=' '):
         """
         Plot data and Bazin fitted function.
 
@@ -307,7 +548,7 @@ class LightCurve(object):
             # filter flag
             filter_flag = self.photometry['band'] == self.filters[i]
             x = self.photometry['mjd'][filter_flag].values
-            y = self.photometry['flux'][filter_flag].values
+            y = self.photometry['flux'][filter_flag].values - np.min(self.photometry['flux'].values)
             yerr = self.photometry['fluxerr'][filter_flag].values
 
             # shift to avoid large numbers in x-axis
@@ -331,6 +572,109 @@ class LightCurve(object):
             plt.savefig(output_file)
         if show:
             plt.show()
+            
+    def plot_GP_fit(self, save=False, show=True, output_file=' ', threeDim=False, plot_bazin=True, figsize=(10,10)):
+        """
+        Plot data and GP fitted function.
+
+        Parameters
+        ----------
+        save: bool (optional)
+             Save figure to file. Default is True.
+        show: bool (optional)
+             Display plot in window. Default is False.
+        output_file: str
+            Name of file to store the plot.
+        threeDim: bool (optional)
+            Plot the fit in 3D. Default is False.
+        """
+        
+        bands = np.unique(self.photometry['lambda_cen'])
+
+        X = np.vstack([self.photometry['mjd']-np.min(self.photometry['mjd']), self.photometry['lambda_cen']]).T
+        y = self.photometry['flux'] - np.min(self.photometry['flux'])
+        dy = self.photometry['fluxerr']
+        
+        if len(self.GP_kernel_params[:-1]) == 9:
+            kn = kernel_RBF(*self.GP_kernel_params[:-1])
+            
+        elif len(self.GP_kernel_params[:-1]) == 3:
+            kn = kernel_Matern(*self.GP_kernel_params[:-1])
+            
+        else:
+            raise ValueError('Unexpected number of kernel hyperparameters in self.GP_kernel_params.')
+            
+        gp = GaussianProcessRegressor(kernel=kn,alpha=dy,n_restarts_optimizer=0)
+        gp.fit(X,y)
+                
+        time_plot = np.arange(np.floor(np.min(X[:,0])), np.ceil(np.max(X[:,0]))+1.)
+        
+        if not threeDim:
+       
+            h,axes = plt.subplots(2,int(len(self.filters) / 2 + len(self.filters) % 2), figsize=figsize)
+            for k,ax in enumerate(axes.flatten()):              
+                
+                wavelength_plot = bands[k]
+                tgp, wgp = np.meshgrid(time_plot, wavelength_plot)
+                x = np.vstack([tgp.flatten(), wgp.flatten()]).T
+
+                y_plot, sigma_plot = gp.predict(x, return_std=True)
+                
+                filter_flag = X[:,1] == bands[k]
+                ax.errorbar(X[:,0][filter_flag],y[filter_flag],dy[filter_flag],fmt='.',color='k')
+
+                ax.plot(tgp.mean(0),y_plot, label='GP',color='C1')
+                ax.fill_between(tgp.mean(0),y_plot+sigma_plot,y_plot-sigma_plot,alpha=0.3,color='C1')
+                
+                if plot_bazin:
+                    bfilter_flag = self.photometry['band'] == self.filters[k]
+                    bx = self.photometry['mjd'][filter_flag].values
+
+                    # shift to avoid large numbers in x-axis
+                    btime = bx - min(bx)
+                    bxaxis = np.linspace(0, max(btime), 500)[:, np.newaxis]
+                    # calculate fitted function
+                    fitted_flux = np.array([bazin(t, self.bazin_features[k * 5],
+                                                  self.bazin_features[k * 5 + 1],
+                                                  self.bazin_features[k * 5 + 2],
+                                                  self.bazin_features[k * 5 + 3],
+                                                  self.bazin_features[k * 5 + 4])
+                                            for t in bxaxis])
+
+                    ax.plot(bxaxis, fitted_flux, color='C0', label='Bazin')
+                    
+                if k == 0:
+                    ax.legend(loc='best')
+
+                ax.set_title('Filter: {0}'.format(self.filters[k]))
+                ax.set_ylabel('Flux')
+                ax.set_xlabel('MJD - {0}'.format(np.min(self.photometry['mjd'])))
+            plt.tight_layout()
+
+        else: #if threeDim
+            
+            wavelength_plot = np.linspace(np.floor(np.min(X[:,1])), np.ceil(np.max(X[:,1]))+1., 100)
+            time_grid, wavelength_grid = np.meshgrid(time_plot, wavelength_plot)
+            x = np.vstack([time_grid.flatten(), wavelength_grid.flatten()]).T
+            
+            y_pred, sigma = gp.predict(x, return_std=True)
+            
+            fig = plt.figure()
+            ax = fig.gca(projection='3d')
+
+            ax.scatter(X[:,1],X[:,0],y,c='k')
+
+            surf = ax.plot_surface(wavelength_grid,time_grid, y_pred.reshape(np.shape(time_grid)), cmap=plt.cm.viridis)
+
+            ax.set_xlabel('$\lambda$')
+            ax.set_ylabel('MJD - {0}'.format(np.min(self.photometry['mjd'])))
+            ax.set_zlabel('Flux')
+            plt.tight_layout()
+
+        if save:
+            plt.savefig(output_file)
+        if show:
+            plt.show()
 
 
 def fit_snpcc_bazin(path_to_data_dir: str, features_file: str):
@@ -348,7 +692,7 @@ def fit_snpcc_bazin(path_to_data_dir: str, features_file: str):
     file_list_all = os.listdir(path_to_data_dir)
     lc_list = [elem for elem in file_list_all if 'DES_SN' in elem]
 
-    # count survivers
+    # count survivors
     count_surv = 0
 
     # add headers to files
@@ -381,9 +725,242 @@ def fit_snpcc_bazin(path_to_data_dir: str, features_file: str):
     param_file.close()
 
 
+def run_parallel_bazin(obj: int, feature_list: list, path_to_metadata: str, namespace, num_classes = 8):
+    try:
+        lc = LightCurve()
+        lc.load_plasticc_lc(namespace.md_table, namespace.lc_table, obj, path_to_metadata = path_to_metadata, num_classes=num_classes)
+        lc.fit_bazin_all()
+
+        feats = [str(lc.id), str(lc.redshift), str(lc.sntype), str(lc.sample)]
+        feats.extend([str(item) for item in lc.bazin_features])
+        feats.extend([str(item) for item in lc.bazin_band_cost])
+
+        feature_list.append(feats)
+
+    except ValueError:
+        pass    
+    
+def fit_plasticc_bazin(path_to_data: str, path_to_metadata: str, features_file: str, parallel: bool = False, num_classes = 8):
+    """Fit Bazin functions to all filters in training and test samples.
+
+    Parameters
+    ----------
+    path_to_data: str
+        File path for the data file of choice.
+    path_to_metadata: str
+        File path for the metadata file of choice (either train or test).
+    features_file: str
+        Path to output file where results should be stored.
+    """
+
+    # read file names
+    with open(path_to_metadata,'rb') as f1:
+        md_table = Table.read(f1,format='csv')
+        
+    with open(path_to_data,'rb') as f2:
+        lc_table = Table.read(f2,format='csv')
+        
+    final_md_table = md_table[np.isin(md_table['object_id'],np.unique(lc_table['object_id']))]
+    lc_list = final_md_table['object_id'].tolist()
+    
+    # count survivors
+    count_surv = 0
+
+    # add headers to files
+    with open(features_file, 'w') as param_file:
+        param_file.write('id redshift type sample ' + 
+                         'uA uB ut0 utfall utrise gA gB gt0 gtfall gtrise rA rB rt0 rtfall rtrise ' + 
+                         'iA iB it0 itfall itrise zA zB zt0 ztfall ztrise yA yB yt0 ytfall ytrise ' + 
+                         'ucost gcost rcost icost zcost ycost \n')
+    if not parallel:
+        for obj in lc_list:
+            try:
+                # fit individual light curves
+                lc = LightCurve()
+                lc.load_plasticc_lc(final_md_table, lc_table, obj, path_to_metadata = path_to_metadata, num_classes = num_classes)
+                lc.fit_bazin_all()
+
+                print(lc_list.index(obj), ' - id:', lc.id, ' - type:', lc.sntype)
+
+                # append results to the correct matrix
+                if 'None' not in lc.bazin_features:
+                    count_surv = count_surv + 1
+                    print('Survived: ', count_surv)
+
+                    # save features to file
+                    with open(features_file, 'a') as param_file:
+                        param_file.write(str(lc.id) + ' ' + str(lc.redshift) + ' ' + str(lc.sntype) + ' ')
+                        param_file.write(str(lc.sample) + ' ')
+                        for item in lc.bazin_features:
+                            param_file.write(str(item) + ' ')
+                        for item in lc.bazin_band_cost:
+                            param_file.write(str(item) + ' ')
+                        param_file.write('\n')
+
+            except ValueError:
+                continue
+                
+    else: # if parallel
+        
+        feature_list = []
+        
+        manager = Manager()
+        m_feature_list = manager.list()
+        
+        ns = manager.Namespace()
+        ns.md_table = final_md_table
+        ns.lc_table = lc_table
+   
+        pool = multiprocessing.Pool(multiprocessing.cpu_count())
+        
+        for _ in tqdm(pool.imap_unordered(partial(\
+                         run_parallel_bazin,\
+                         feature_list=m_feature_list,namespace=ns,path_to_metadata=path_to_metadata, num_classes = num_classes\
+                        ),\
+                 lc_list), total=len(lc_list)):
+            pass
+        pool.close()
+        pool.join()
+        
+        feature_list.extend(m_feature_list)
+            
+        with open(features_file,'a') as param_file:
+            np.savetxt(param_file, feature_list, delimiter=' ', fmt='%s')
+
+            
+def run_parallel_GP(obj: int, feature_list: list, path_to_metadata: str, namespace, restarts: int = 0, num_classes = 8, kernel_type=1):
+    try:
+        lc = LightCurve()
+        lc.load_plasticc_lc(namespace.md_table, namespace.lc_table, obj, path_to_metadata = path_to_metadata, num_classes = num_classes)
+        lc.fit_GP(restarts=restarts, kernel_type=kernel_type)
+        
+        assert np.all(np.isfinite(lc.GP_features)), 'One or more of the extracted features fails np.isfinite().'
+
+        feats = [str(lc.id), str(lc.redshift), str(lc.sntype), str(lc.sample)]
+        feats.extend([str(item) for item in lc.GP_features])
+        
+        feature_list.append(feats)
+
+    except ValueError:
+        pass    
+
+def fit_plasticc_GP(path_to_data: str, path_to_metadata: str, features_file: str, parallel: bool = True, restarts: int = 0, num_classes = 8, kernel_type=1):
+    """Fit Bazin functions to all filters in training and test samples.
+
+    Parameters
+    ----------
+    path_to_data: str
+        File path for the data file of choice.
+    path_to_metadata: str
+        File path for the metadata file of choice (either train or test).
+    features_file: str
+        Path to output file where results should be stored.
+    """
+
+    # read file names
+    with open(path_to_metadata,'rb') as f1:
+        md_table = Table.read(f1,format='csv')
+        
+    with open(path_to_data,'rb') as f2:
+        lc_table = Table.read(f2,format='csv')
+        
+    final_md_table = md_table[np.isin(md_table['object_id'],np.unique(lc_table['object_id']))]
+    lc_list = final_md_table['object_id'].tolist()
+    
+    # count survivors
+    count_surv = 0
+
+    # add headers to files
+    with open(features_file, 'w') as param_file:
+        
+        if kernel_type == 0 or kernel_type == 1:
+            param_file.write('id redshift type sample ' +\
+                             'host_photoz host_photoz_err ' +\
+                             'pkmag_i pos_flux_ratio max_fr_blue min_fr_blue ' + \
+                             'max_fr_red min_fr_red max_dt_yg positive_width time_fwd_max_20 time_fwd_max_50 ' +\
+                             'time_bwd_max_20 time_bwd_max_50 time_fwd_max_20_ratio_blue ' +\
+                             'time_fwd_max_50_ratio_blue time_bwd_max_20_ratio_blue time_bwd_max_50_ratio_blue ' +\
+                             'time_fwd_max_20_ratio_red time_fwd_max_50_ratio_red time_bwd_max_20_ratio_red ' +\
+                             'time_bwd_max_50_ratio_red frac_s2n_5 frac_background time_width_s2n_5 ' +\
+                             'count_max_center count_max_rise_20 count_max_rise_50 count_max_rise_100 ' +\
+                             'count_max_fall_20 count_max_fall_50 count_max_fall_100 total_s2n ' +\
+                             'c1 rbf1_t rbf1_l c2 rbf2_t rbf2_l c3 rbf3_t rbf3_l loglike \n')
+            
+        elif kernel_type == 2:
+            param_file.write('id redshift type sample ' +\
+                             'host_photoz host_photoz_err ' +\
+                             'pkmag_i pos_flux_ratio max_fr_blue min_fr_blue ' + \
+                             'max_fr_red min_fr_red max_dt_yg positive_width time_fwd_max_20 time_fwd_max_50 ' +\
+                             'time_bwd_max_20 time_bwd_max_50 time_fwd_max_20_ratio_blue ' +\
+                             'time_fwd_max_50_ratio_blue time_bwd_max_20_ratio_blue time_bwd_max_50_ratio_blue ' +\
+                             'time_fwd_max_20_ratio_red time_fwd_max_50_ratio_red time_bwd_max_20_ratio_red ' +\
+                             'time_bwd_max_50_ratio_red frac_s2n_5 frac_background time_width_s2n_5 ' +\
+                             'count_max_center count_max_rise_20 count_max_rise_50 count_max_rise_100 ' +\
+                             'count_max_fall_20 count_max_fall_50 count_max_fall_100 total_s2n ' +\
+                             'c1 matern_t matern_l loglike \n')
+       
+        
+    if not parallel:
+        for obj in lc_list:
+            try:
+                # fit individual light curves
+                lc = LightCurve()
+                lc.load_plasticc_lc(final_md_table, lc_table, obj, path_to_metadata = path_to_metadata, num_classes = num_classes)
+                lc.fit_GP(restarts=restarts, kernel_type=kernel_type)
+                
+                assert np.all(np.isfinite(lc.GP_features)), 'One or more of the extracted features fails np.isfinite().'
+
+                print(lc_list.index(obj), ' - id:', lc.id, ' - type:', lc.sntype)
+
+                # append results to the correct matrix
+                if len(lc.GP_features) > 2:
+                    count_surv = count_surv + 1
+                    print('Survived: ', count_surv)
+
+                    # save features to file
+                    with open(features_file, 'a') as param_file:
+                        param_file.write(str(lc.id) + ' ' + str(lc.redshift) + ' ' + str(lc.sntype) + ' ')
+                        param_file.write(str(lc.sample) + ' ')
+                        for item in lc.GP_features:
+                            param_file.write(str(item) + ' ')
+                            
+                        ### These are now included in GP_features
+                        #for item in lc.GP_kernel_params:
+                        #    param_file.write(str(item) + ' ')
+                        param_file.write('\n')
+
+            except ValueError:
+                continue
+                
+    else: # if parallel
+        
+        feature_list = []
+        
+        manager = Manager()
+        m_feature_list = manager.list()
+        
+        ns = manager.Namespace()
+        ns.md_table = final_md_table
+        ns.lc_table = lc_table
+        
+        pool = multiprocessing.Pool(multiprocessing.cpu_count())
+        for _ in tqdm(pool.imap(partial(run_parallel_GP,\
+                                        feature_list=m_feature_list, path_to_metadata=path_to_metadata, namespace=ns,\
+                                        restarts=0, num_classes=num_classes, kernel_type=kernel_type),\
+                                lc_list), total=len(lc_list)):
+            pass
+        pool.close()
+        pool.join()
+        
+        feature_list.extend(m_feature_list)
+        
+        print('Successfully fit {0} light curves'.format(len(feature_list)))
+            
+        with open(features_file,'a') as param_file:
+            np.savetxt(param_file, feature_list, delimiter=' ', fmt='%s')
+            
 def main():
     return None
-
 
 if __name__ == '__main__':
     main()
